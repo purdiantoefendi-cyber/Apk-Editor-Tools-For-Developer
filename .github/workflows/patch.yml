@@ -1,0 +1,102 @@
+name: Generate Patch from Custom Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'URL repo sumber atau format owner/repo (contoh: torvalds/linux)'
+        required: true
+        type: string
+      commit_hashes:
+        description: 'Daftar commit hash, pisahkan dengan spasi atau koma (contoh: hash1 hash2 hash3)'
+        required: true
+        type: string
+      patch_dir:
+        description: 'Folder tujuan penyimpanan patch di branch default'
+        required: false
+        default: 'patch'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-patches:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Fetch commits and generate patches
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          COMMIT_HASHES: ${{ inputs.commit_hashes }}
+          PATCH_DIR: ${{ inputs.patch_dir }}
+        run: |
+          set -e
+
+          # Normalisasi URL repo sumber (mendukung "owner/repo" maupun URL penuh)
+          if [[ "$SOURCE_REPO" != http* && "$SOURCE_REPO" != git@* ]]; then
+            REPO_URL="https://github.com/${SOURCE_REPO}.git"
+          else
+            REPO_URL="$SOURCE_REPO"
+          fi
+
+          # Tambahkan remote sementara
+          git remote add custom_src "$REPO_URL"
+
+          # Ubah koma menjadi spasi agar mendukung format "hash1, hash2" maupun "hash1 hash2"
+          CLEAN_HASHES=$(echo "$COMMIT_HASHES" | tr ',' ' ')
+
+          mkdir -p "$PATCH_DIR"
+          INDEX=1
+          FETCHED_ALL=0
+
+          for HASH in $CLEAN_HASHES; do
+            echo "Memproses commit: $HASH"
+
+            # Ambil commit dari repo sumber (gunakan full hash untuk fetch cepat --depth=1)
+            if ! git cat-file -e "${HASH}^{commit}" 2>/dev/null; then
+              if ! git fetch --depth=1 custom_src "$HASH" 2>/dev/null; then
+                if [ "$FETCHED_ALL" -eq 0 ]; then
+                  echo "Short hash terdeteksi, mengambil seluruh ref dari repo sumber..."
+                  git fetch custom_src
+                  FETCHED_ALL=1
+                fi
+              fi
+            fi
+
+            # Validasi commit hash
+            if ! git rev-parse --verify "${HASH}^{commit}" >/dev/null 2>&1; then
+              echo "Error: Commit hash '$HASH' tidak ditemukan di $REPO_URL"
+              exit 1
+            fi
+
+            # Generate file .patch dengan penomoran urut (0001-..., 0002-..., dst.)
+            git format-patch -1 --start-number "$INDEX" "$HASH" -o "$PATCH_DIR"
+            INDEX=$((INDEX + 1))
+          done
+
+          # Hapus remote sementara
+          git remote remove custom_src
+
+      - name: Commit and push patches to default branch
+        env:
+          PATCH_DIR: ${{ inputs.patch_dir }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$PATCH_DIR"
+
+          if git diff --staged --quiet; then
+            echo "Tidak ada perubahan patch baru untuk di-commit."
+            exit 0
+          fi
+
+          git commit -m "chore(patch): add patches from ${SOURCE_REPO}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
