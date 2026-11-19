@@ -1,0 +1,939 @@
+From 2a522b4cea8745c32e9be3122e76e0f36b110628 Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Thu, 18 Apr 2019 22:07:57 -0700
+Subject: [PATCH] devfreq_boost: Introduce devfreq boost driver.
+
+This driver boosts enumerated devfreq devices upon input, and allows for
+boosting specific devfreq devices on other custom events. The boost
+frequencies for this driver should be set so that frame drops are
+near-zero at the boosted frequencies and power consumption is minimized
+at said frequencies. The goal of this driver is to provide an interface
+to achieve optimal device performance by requesting boosts on key
+events, such as when a frame is ready to rendered to the display.
+
+Currently, support is only present for boosting the cpubw devfreq
+device, but the driver is structured in a way that makes it easy to add
+support for new boostable devfreq devices in the future.
+
+[diepquynh: Adapted to trinket]
+Signed-off-by: Vishalcj17 <vishalcj@aospa.co>
+Change-Id: I0712a1e7607441ce15fb0b1aaf978d6457f840c2
+Signed-off-by: SparXFusion <s2234nadar@gmail.com>
+Signed-off-by: Sarthak Roy <sarthak.roy@s.amity.edu>
+Signed-off-by: fjrXTR <fajarslebew31@gmail.com>
+---
+ drivers/devfreq/Kconfig         |  33 ++++
+ drivers/devfreq/Makefile        |   3 +
+ drivers/devfreq/devfreq.c       |  17 +-
+ drivers/devfreq/devfreq_boost.c | 332 ++++++++++++++++++++++++++++++++
+ drivers/devfreq/devfreq_devbw.c | 297 ++++++++++++++++++++++++++++
+ include/linux/devfreq.h         |  24 +++
+ include/linux/devfreq_boost.h   |  34 ++++
+ 7 files changed, 736 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/devfreq/devfreq_boost.c
+ create mode 100644 drivers/devfreq/devfreq_devbw.c
+ create mode 100644 include/linux/devfreq_boost.h
+
+diff --git a/drivers/devfreq/Kconfig b/drivers/devfreq/Kconfig
+index 13e6f7bc6..d881dceb8 100644
+--- a/drivers/devfreq/Kconfig
++++ b/drivers/devfreq/Kconfig
+@@ -145,6 +145,39 @@ config MTK_DVFSRC_MT6781_PRETEST
+ 	  It just for test, and it will remove after mt6781 chip
+ 	  is ready.
+ 	  If unsure, say N
++
++config DEVFREQ_BOOST
++	bool "Devfreq Boost"
++	help
++	  Boosts enumerated devfreq devices upon input, and allows for boosting
++	  specific devfreq devices on other custom events. The boost frequencies
++	  for this driver should be set so that frame drops are near-zero at the
++	  boosted frequencies and power consumption is minimized at said
++	  frequencies. The goal of this driver is to provide an interface to
++	  achieve optimal device performance by requesting boosts on key events,
++	  such as when a frame is ready to rendered to the display.
++
++if DEVFREQ_BOOST
++
++config DEVFREQ_INPUT_BOOST_DURATION_MS
++	int "Input boost duration"
++	default "100"
++	help
++	  Input boost duration in milliseconds for all boostable devices.
++
++config DEVFREQ_WAKE_BOOST_DURATION_MS
++	int "Wake boost duration"
++	default "1000"
++	help
++	  Wake boost duration in milliseconds for all boostable devices.
++
++config DEVFREQ_MSM_CPUBW_BOOST_FREQ
++	int "Boost freq for cpubw device"
++	default "0"
++	help
++	  Boost frequency for the MSM DDR bus.
++
++endif
+ source "drivers/devfreq/event/Kconfig"
+ 
+ endif # PM_DEVFREQ
+diff --git a/drivers/devfreq/Makefile b/drivers/devfreq/Makefile
+index f0ab450a3..bfb9866f2 100644
+--- a/drivers/devfreq/Makefile
++++ b/drivers/devfreq/Makefile
+@@ -58,3 +58,6 @@ obj-$(CONFIG_MACH_MT6877)		+= helio-dvfsrc-v3/
+ obj-$(CONFIG_MACH_MT6781)		+= helio-dvfsrc-v3/
+ # DEVFREQ Event Drivers
+ obj-$(CONFIG_PM_DEVFREQ_EVENT)		+= event/
++
++# DEVFREQ Boost
++obj-$(CONFIG_DEVFREQ_BOOST)		+= devfreq_boost.o
+diff --git a/drivers/devfreq/devfreq.c b/drivers/devfreq/devfreq.c
+index 0f7b2f746..e41658f1f 100644
+--- a/drivers/devfreq/devfreq.c
++++ b/drivers/devfreq/devfreq.c
+@@ -313,10 +313,15 @@ int update_devfreq(struct devfreq *devfreq)
+ 	if (!devfreq->governor)
+ 		return -EINVAL;
+ 
+-	/* Reevaluate the proper frequency */
+-	err = devfreq->governor->get_target_freq(devfreq, &freq);
+-	if (err)
+-		return err;
++	if (devfreq->max_boost) {
++		/* Use the max freq for max boosts */
++		freq = ULONG_MAX;
++	} else {
++		/* Reevaluate the proper frequency */
++		err = devfreq->governor->get_target_freq(devfreq, &freq);
++		if (err)
++			return err;
++	}
+ 
+ 	/*
+ 	 * Adjust the frequency with user freq, QoS and available freq.
+@@ -1211,6 +1216,10 @@ static ssize_t min_freq_store(struct device *dev, struct device_attribute *attr,
+ 	unsigned long value;
+ 	int ret;
+ 
++	/* Minfreq is managed by devfreq_boost */
++	if (df->is_boost_device)
++		return count;
++
+ 	ret = sscanf(buf, "%lu", &value);
+ 	if (ret != 1)
+ 		return -EINVAL;
+diff --git a/drivers/devfreq/devfreq_boost.c b/drivers/devfreq/devfreq_boost.c
+new file mode 100644
+index 000000000..fecb137f4
+--- /dev/null
++++ b/drivers/devfreq/devfreq_boost.c
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2018-2019 Sultan Alsawaf <sultan@kerneltoast.com>.
++ */
++
++#define pr_fmt(fmt) "devfreq_boost: " fmt
++
++#include <linux/devfreq_boost.h>
++#include <linux/fb.h>
++#include <linux/input.h>
++#include <linux/kthread.h>
++#include <uapi/linux/sched/types.h>
++
++enum {
++	SCREEN_OFF,
++	INPUT_BOOST,
++	MAX_BOOST
++};
++
++struct boost_dev {
++	struct devfreq *df;
++	struct delayed_work input_unboost;
++	struct delayed_work max_unboost;
++	wait_queue_head_t boost_waitq;
++	atomic_long_t max_boost_expires;
++	unsigned long boost_freq;
++	unsigned long state;
++};
++
++struct df_boost_drv {
++	struct boost_dev devices[DEVFREQ_MAX];
++	struct notifier_block fb_notif;
++};
++
++static void devfreq_input_unboost(struct work_struct *work);
++static void devfreq_max_unboost(struct work_struct *work);
++
++#define BOOST_DEV_INIT(b, dev, freq) .devices[dev] = {				\
++	.input_unboost =							\
++		__DELAYED_WORK_INITIALIZER((b).devices[dev].input_unboost,	\
++					   devfreq_input_unboost, 0),		\
++	.max_unboost =								\
++		__DELAYED_WORK_INITIALIZER((b).devices[dev].max_unboost,	\
++					   devfreq_max_unboost, 0),		\
++	.boost_waitq =								\
++		__WAIT_QUEUE_HEAD_INITIALIZER((b).devices[dev].boost_waitq),	\
++	.boost_freq = freq							\
++}
++
++static struct df_boost_drv df_boost_drv_g __read_mostly = {
++	BOOST_DEV_INIT(df_boost_drv_g, DEVFREQ_MSM_CPUBW,
++		       CONFIG_DEVFREQ_MSM_CPUBW_BOOST_FREQ)
++};
++
++static void __devfreq_boost_kick(struct boost_dev *b)
++{
++	if (!READ_ONCE(b->df) || test_bit(SCREEN_OFF, &b->state))
++		return;
++
++	set_bit(INPUT_BOOST, &b->state);
++	if (!mod_delayed_work(system_unbound_wq, &b->input_unboost,
++		msecs_to_jiffies(CONFIG_DEVFREQ_INPUT_BOOST_DURATION_MS)))
++		wake_up(&b->boost_waitq);
++}
++
++void devfreq_boost_kick(enum df_device device)
++{
++	struct df_boost_drv *d = &df_boost_drv_g;
++
++	__devfreq_boost_kick(d->devices + device);
++}
++
++static void __devfreq_boost_kick_max(struct boost_dev *b,
++				     unsigned int duration_ms)
++{
++	unsigned long boost_jiffies = msecs_to_jiffies(duration_ms);
++	unsigned long curr_expires, new_expires;
++
++	if (!READ_ONCE(b->df) || test_bit(SCREEN_OFF, &b->state))
++		return;
++
++	do {
++		curr_expires = atomic_long_read(&b->max_boost_expires);
++		new_expires = jiffies + boost_jiffies;
++
++		/* Skip this boost if there's a longer boost in effect */
++		if (time_after(curr_expires, new_expires))
++			return;
++	} while (atomic_long_cmpxchg(&b->max_boost_expires, curr_expires,
++				     new_expires) != curr_expires);
++
++	set_bit(MAX_BOOST, &b->state);
++	if (!mod_delayed_work(system_unbound_wq, &b->max_unboost,
++			      boost_jiffies))
++		wake_up(&b->boost_waitq);
++}
++
++void devfreq_boost_kick_max(enum df_device device, unsigned int duration_ms)
++{
++	struct df_boost_drv *d = &df_boost_drv_g;
++
++	__devfreq_boost_kick_max(d->devices + device, duration_ms);
++}
++
++void devfreq_register_boost_device(enum df_device device, struct devfreq *df)
++{
++	struct df_boost_drv *d = &df_boost_drv_g;
++	struct boost_dev *b;
++
++	df->is_boost_device = true;
++	b = d->devices + device;
++	WRITE_ONCE(b->df, df);
++}
++
++static void devfreq_input_unboost(struct work_struct *work)
++{
++	struct boost_dev *b = container_of(to_delayed_work(work),
++					   typeof(*b), input_unboost);
++
++	clear_bit(INPUT_BOOST, &b->state);
++	wake_up(&b->boost_waitq);
++}
++
++static void devfreq_max_unboost(struct work_struct *work)
++{
++	struct boost_dev *b = container_of(to_delayed_work(work),
++					   typeof(*b), max_unboost);
++
++	clear_bit(MAX_BOOST, &b->state);
++	wake_up(&b->boost_waitq);
++}
++
++static void devfreq_update_boosts(struct boost_dev *b, unsigned long state)
++{
++	struct devfreq *df = b->df;
++
++	mutex_lock(&df->lock);
++	if (test_bit(SCREEN_OFF, &state)) {
++		df->min_freq = df->profile->freq_table[0];
++		df->max_boost = false;
++	} else {
++		df->min_freq = test_bit(INPUT_BOOST, &state) ?
++			       min(b->boost_freq, df->max_freq) :
++			       df->profile->freq_table[0];
++		df->max_boost = test_bit(MAX_BOOST, &state);
++	}
++	update_devfreq(df);
++	mutex_unlock(&df->lock);
++}
++
++static int devfreq_boost_thread(void *data)
++{
++	static const struct sched_param sched_max_rt_prio = {
++		.sched_priority = MAX_RT_PRIO - 1
++	};
++	struct boost_dev *b = data;
++	unsigned long old_state = 0;
++
++	sched_setscheduler_nocheck(current, SCHED_FIFO, &sched_max_rt_prio);
++
++	while (1) {
++		bool should_stop = false;
++		unsigned long curr_state;
++
++		wait_event(b->boost_waitq,
++			(curr_state = READ_ONCE(b->state)) != old_state ||
++			(should_stop = kthread_should_stop()));
++
++		if (should_stop)
++			break;
++
++		old_state = curr_state;
++		devfreq_update_boosts(b, curr_state);
++	}
++
++	return 0;
++}
++
++static int fb_notifier_cb(struct notifier_block *nb, unsigned long action,
++			  void *data)
++{
++	struct df_boost_drv *d = container_of(nb, typeof(*d), fb_notif);
++	int i, *blank = ((struct fb_event *)data)->data;
++
++	/* Parse framebuffer blank events as soon as they occur */
++	if (action != FB_EARLY_EVENT_BLANK)
++		return NOTIFY_OK;
++
++	/* Boost when the screen turns on and unboost when it turns off */
++	for (i = 0; i < DEVFREQ_MAX; i++) {
++		struct boost_dev *b = d->devices + i;
++
++		if (*blank == FB_BLANK_UNBLANK) {
++			clear_bit(SCREEN_OFF, &b->state);
++			__devfreq_boost_kick_max(b,
++				CONFIG_DEVFREQ_WAKE_BOOST_DURATION_MS);
++		} else {
++			set_bit(SCREEN_OFF, &b->state);
++			wake_up(&b->boost_waitq);
++		}
++	}
++
++	return NOTIFY_OK;
++}
++
++static void devfreq_boost_input_event(struct input_handle *handle,
++				      unsigned int type, unsigned int code,
++				      int value)
++{
++	struct df_boost_drv *d = handle->handler->private;
++	int i;
++
++	for (i = 0; i < DEVFREQ_MAX; i++)
++		__devfreq_boost_kick(d->devices + i);
++}
++
++static int devfreq_boost_input_connect(struct input_handler *handler,
++				       struct input_dev *dev,
++				       const struct input_device_id *id)
++{
++	struct input_handle *handle;
++	int ret;
++
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle)
++		return -ENOMEM;
++
++	handle->dev = dev;
++	handle->handler = handler;
++	handle->name = "devfreq_boost_handle";
++
++	ret = input_register_handle(handle);
++	if (ret)
++		goto free_handle;
++
++	ret = input_open_device(handle);
++	if (ret)
++		goto unregister_handle;
++
++	return 0;
++
++unregister_handle:
++	input_unregister_handle(handle);
++free_handle:
++	kfree(handle);
++	return ret;
++}
++
++static void devfreq_boost_input_disconnect(struct input_handle *handle)
++{
++	input_close_device(handle);
++	input_unregister_handle(handle);
++	kfree(handle);
++}
++
++static const struct input_device_id devfreq_boost_ids[] = {
++	/* Multi-touch touchscreen */
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
++			INPUT_DEVICE_ID_MATCH_ABSBIT,
++		.evbit = { BIT_MASK(EV_ABS) },
++		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
++			BIT_MASK(ABS_MT_POSITION_X) |
++			BIT_MASK(ABS_MT_POSITION_Y) }
++	},
++	/* Touchpad */
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT |
++			INPUT_DEVICE_ID_MATCH_ABSBIT,
++		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
++		.absbit = { [BIT_WORD(ABS_X)] =
++			BIT_MASK(ABS_X) | BIT_MASK(ABS_Y) }
++	},
++	/* Keypad */
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
++		.evbit = { BIT_MASK(EV_KEY) }
++	},
++	{ }
++};
++
++static struct input_handler devfreq_boost_input_handler = {
++	.event		= devfreq_boost_input_event,
++	.connect	= devfreq_boost_input_connect,
++	.disconnect	= devfreq_boost_input_disconnect,
++	.name		= "devfreq_boost_handler",
++	.id_table	= devfreq_boost_ids
++};
++
++static int __init devfreq_boost_init(void)
++{
++	struct df_boost_drv *d = &df_boost_drv_g;
++	struct task_struct *thread[DEVFREQ_MAX];
++	int i, ret;
++
++	for (i = 0; i < DEVFREQ_MAX; i++) {
++		struct boost_dev *b = d->devices + i;
++
++		thread[i] = kthread_run(devfreq_boost_thread, b,
++					"devfreq_boostd/%d", i);
++		if (IS_ERR(thread[i])) {
++			ret = PTR_ERR(thread[i]);
++			pr_err("Failed to create kthread, err: %d\n", ret);
++			goto stop_kthreads;
++		}
++	}
++
++	devfreq_boost_input_handler.private = d;
++	ret = input_register_handler(&devfreq_boost_input_handler);
++	if (ret) {
++		pr_err("Failed to register input handler, err: %d\n", ret);
++		goto stop_kthreads;
++	}
++
++	d->fb_notif.notifier_call = fb_notifier_cb;
++	d->fb_notif.priority = INT_MAX;
++	ret = fb_register_client(&d->fb_notif);
++	if (ret) {
++		pr_err("Failed to register fb notifier, err: %d\n", ret);
++		goto unregister_handler;
++	}
++
++	return 0;
++
++unregister_handler:
++	input_unregister_handler(&devfreq_boost_input_handler);
++stop_kthreads:
++	while (i--)
++		kthread_stop(thread[i]);
++	return ret;
++}
++late_initcall(devfreq_boost_init);
+diff --git a/drivers/devfreq/devfreq_devbw.c b/drivers/devfreq/devfreq_devbw.c
+new file mode 100644
+index 000000000..dd99c1699
+--- /dev/null
++++ b/drivers/devfreq/devfreq_devbw.c
+@@ -0,0 +1,297 @@
++/*
++ * Copyright (c) 2013-2014, 2018-2019, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#define pr_fmt(fmt) "devbw: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/delay.h>
++#include <linux/ktime.h>
++#include <linux/time.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/mutex.h>
++#include <linux/interrupt.h>
++#include <linux/devfreq.h>
++#include <linux/slab.h>
++#include <linux/of.h>
++#include <linux/of_fdt.h>
++#include <trace/events/power.h>
++#include <linux/msm-bus.h>
++#include <linux/msm-bus-board.h>
++#include <linux/devfreq_boost.h>
++
++/* Has to be ULL to prevent overflow where this macro is used. */
++#define MBYTE (1ULL << 20)
++#define MAX_PATHS	2
++#define DBL_BUF		2
++
++struct dev_data {
++	struct msm_bus_vectors vectors[MAX_PATHS * DBL_BUF];
++	struct msm_bus_paths bw_levels[DBL_BUF];
++	struct msm_bus_scale_pdata bw_data;
++	int num_paths;
++	u32 bus_client;
++	int cur_idx;
++	int cur_ab;
++	int cur_ib;
++	long gov_ab;
++	struct devfreq *df;
++	struct devfreq_dev_profile dp;
++};
++
++static int set_bw(struct device *dev, int new_ib, int new_ab)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++	int i, ret;
++
++	if (d->cur_ib == new_ib && d->cur_ab == new_ab)
++		return 0;
++
++	i = (d->cur_idx + 1) % DBL_BUF;
++
++	d->bw_levels[i].vectors[0].ib = new_ib * MBYTE;
++	d->bw_levels[i].vectors[0].ab = new_ab / d->num_paths * MBYTE;
++	d->bw_levels[i].vectors[1].ib = new_ib * MBYTE;
++	d->bw_levels[i].vectors[1].ab = new_ab / d->num_paths * MBYTE;
++
++	dev_dbg(dev, "BW MBps: AB: %d IB: %d\n", new_ab, new_ib);
++
++	ret = msm_bus_scale_client_update_request(d->bus_client, i);
++	if (ret) {
++		dev_err(dev, "bandwidth request failed (%d)\n", ret);
++	} else {
++		d->cur_idx = i;
++		d->cur_ib = new_ib;
++		d->cur_ab = new_ab;
++	}
++
++	return ret;
++}
++
++static int devbw_target(struct device *dev, unsigned long *freq, u32 flags)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++	struct dev_pm_opp *opp;
++
++	opp = devfreq_recommended_opp(dev, freq, flags);
++	if (!IS_ERR(opp))
++		dev_pm_opp_put(opp);
++
++	return set_bw(dev, *freq, d->gov_ab);
++}
++
++static int devbw_get_dev_status(struct device *dev,
++				struct devfreq_dev_status *stat)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++
++	stat->private_data = &d->gov_ab;
++	return 0;
++}
++
++#define PROP_OPERATING_POINTS_V2 "operating-points-v2"
++
++static int add_opp_prop_from_child(struct device *dev,
++				struct device_node *of_child)
++{
++	struct property *prop;
++	int len = 0, ret = 0;
++	void *value;
++	const void *p_val;
++
++	p_val = of_get_property(of_child, PROP_OPERATING_POINTS_V2, &len);
++	if (!p_val)
++		return -ENODEV;
++	value = devm_kzalloc(dev, len, GFP_KERNEL);
++	if (!value)
++		return -ENOMEM;
++	memcpy(value, p_val, len);
++	prop = devm_kzalloc(dev, sizeof(*prop), GFP_KERNEL);
++	if (!prop) {
++		devm_kfree(dev, value);
++		return -ENOMEM;
++	}
++	prop->name = "operating-points-v2";
++	prop->value = value;
++	prop->length = len;
++	ret = of_add_property(dev->of_node, prop);
++	if (ret) {
++		devm_kfree(dev, value);
++		devm_kfree(dev, prop);
++		dev_err(dev, "failed to add property: %d\n", ret);
++	}
++
++	return ret;
++}
++
++static int parse_child_nodes_for_opp(struct device *dev)
++{
++	struct device_node *of_child;
++	int ddr_type_of = -1;
++	int ddr_type = of_fdt_get_ddrtype();
++	int ret = -EINVAL;
++
++	for_each_child_of_node(dev->of_node, of_child) {
++		ret = of_property_read_u32(of_child, "qcom,ddr-type",
++						&ddr_type_of);
++		if (!ret && (ddr_type == ddr_type_of)) {
++			dev_dbg(dev, "ddr-type = %d, is matching DT entry\n",
++						ddr_type_of);
++			ret = add_opp_prop_from_child(dev, of_child);
++			if (ret)
++				return ret;
++			return dev_pm_opp_of_add_table(dev);
++		}
++		ret = -ENODEV;
++	}
++	return ret;
++}
++
++#define PROP_PORTS "qcom,src-dst-ports"
++#define PROP_ACTIVE "qcom,active-only"
++
++int devfreq_add_devbw(struct device *dev)
++{
++	struct dev_data *d;
++	struct devfreq_dev_profile *p;
++	u32 ports[MAX_PATHS * 2];
++	const char *gov_name;
++	int ret, len, i, num_paths;
++
++	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return -ENOMEM;
++	dev_set_drvdata(dev, d);
++
++	if (of_find_property(dev->of_node, PROP_PORTS, &len)) {
++		len /= sizeof(ports[0]);
++		if (len % 2 || len > ARRAY_SIZE(ports)) {
++			dev_err(dev, "Unexpected number of ports\n");
++			return -EINVAL;
++		}
++
++		ret = of_property_read_u32_array(dev->of_node, PROP_PORTS,
++						 ports, len);
++		if (ret)
++			return ret;
++
++		num_paths = len / 2;
++	} else {
++		return -EINVAL;
++	}
++
++	d->bw_levels[0].vectors = &d->vectors[0];
++	d->bw_levels[1].vectors = &d->vectors[MAX_PATHS];
++	d->bw_data.usecase = d->bw_levels;
++	d->bw_data.num_usecases = ARRAY_SIZE(d->bw_levels);
++	d->bw_data.name = dev_name(dev);
++	d->bw_data.active_only = of_property_read_bool(dev->of_node,
++							PROP_ACTIVE);
++
++	for (i = 0; i < num_paths; i++) {
++		d->bw_levels[0].vectors[i].src = ports[2 * i];
++		d->bw_levels[0].vectors[i].dst = ports[2 * i + 1];
++		d->bw_levels[1].vectors[i].src = ports[2 * i];
++		d->bw_levels[1].vectors[i].dst = ports[2 * i + 1];
++	}
++	d->bw_levels[0].num_paths = num_paths;
++	d->bw_levels[1].num_paths = num_paths;
++	d->num_paths = num_paths;
++
++	p = &d->dp;
++	p->polling_ms = 50;
++	p->target = devbw_target;
++	p->get_dev_status = devbw_get_dev_status;
++	if (of_get_child_count(dev->of_node))
++		ret = parse_child_nodes_for_opp(dev);
++	else
++		ret = dev_pm_opp_of_add_table(dev);
++
++	if (ret)
++		dev_err(dev, "Couldn't parse OPP table:%d\n", ret);
++
++	d->bus_client = msm_bus_scale_register_client(&d->bw_data);
++	if (!d->bus_client) {
++		dev_err(dev, "Unable to register bus client\n");
++		return -ENODEV;
++	}
++
++	if (of_property_read_string(dev->of_node, "governor", &gov_name))
++		gov_name = "performance";
++
++	d->df = devfreq_add_device(dev, p, gov_name, NULL);
++	if (IS_ERR(d->df)) {
++		msm_bus_scale_unregister_client(d->bus_client);
++		return PTR_ERR(d->df);
++	}
++
++	if (!strcmp(dev_name(dev), "soc:qcom,cpu-cpu-ddr-bw"))
++		devfreq_register_boost_device(DEVFREQ_MSM_CPUBW, d->df);
++
++	return 0;
++}
++
++int devfreq_remove_devbw(struct device *dev)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++
++	msm_bus_scale_unregister_client(d->bus_client);
++	devfreq_remove_device(d->df);
++	return 0;
++}
++
++int devfreq_suspend_devbw(struct device *dev)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++
++	return devfreq_suspend_device(d->df);
++}
++
++int devfreq_resume_devbw(struct device *dev)
++{
++	struct dev_data *d = dev_get_drvdata(dev);
++
++	return devfreq_resume_device(d->df);
++}
++
++static int devfreq_devbw_probe(struct platform_device *pdev)
++{
++	return devfreq_add_devbw(&pdev->dev);
++}
++
++static int devfreq_devbw_remove(struct platform_device *pdev)
++{
++	return devfreq_remove_devbw(&pdev->dev);
++}
++
++static const struct of_device_id devbw_match_table[] = {
++	{ .compatible = "qcom,devbw" },
++	{}
++};
++
++static struct platform_driver devbw_driver = {
++	.probe = devfreq_devbw_probe,
++	.remove = devfreq_devbw_remove,
++	.driver = {
++		.name = "devbw",
++		.of_match_table = devbw_match_table,
++		.suppress_bind_attrs = true,
++	},
++};
++
++module_platform_driver(devbw_driver);
++MODULE_DESCRIPTION("Device DDR bandwidth voting driver MSM SoCs");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/linux/devfreq.h b/include/linux/devfreq.h
+index 2151a0649..d368b5422 100644
+--- a/include/linux/devfreq.h
++++ b/include/linux/devfreq.h
+@@ -166,6 +166,8 @@ struct devfreq {
+ 	unsigned long max_freq;
+ 	unsigned long scaling_min_freq;
+ 	unsigned long scaling_max_freq;
++	bool is_boost_device;
++	bool max_boost;
+ 	bool stop_polling;
+ 
+ 	/* information for device frequency transition */
+@@ -390,6 +392,28 @@ static inline int devfreq_update_stats(struct devfreq *df)
+ {
+ 	return -EINVAL;
+ }
++
++//cuixiaogang@SRC.hypnus.2018-04-05. add support to set devfreq limit
++static inline int devfreq_set_limit(struct devfreq *df, unsigned long min, unsigned long max)
++{
++            return -EINVAL;
++}
++static inline int devfreq_get_limit(struct devfreq *df, unsigned long *min, unsigned long *max)
++{
++            return -EINVAL;
++}
++static inline int devfreq_set_limit(struct devfreq *df, unsigned long scaling_min, unsigned long scaling_max)
++{
++            return -EINVAL;
++}
++static inline int devfreq_get_limit(struct devfreq *df, unsigned long *scaling_min, unsigned long *scaling_max)
++{
++            return -EINVAL;
++}
++static inline int update_devfreq(struct devfreq *devfreq)
++{
++	return -EINVAL;
++}
+ #endif /* CONFIG_PM_DEVFREQ */
+ 
+ #endif /* __LINUX_DEVFREQ_H__ */
+diff --git a/include/linux/devfreq_boost.h b/include/linux/devfreq_boost.h
+new file mode 100644
+index 000000000..c133705d0
+--- /dev/null
++++ b/include/linux/devfreq_boost.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2018-2019 Sultan Alsawaf <sultan@kerneltoast.com>.
++ */
++#ifndef _DEVFREQ_BOOST_H_
++#define _DEVFREQ_BOOST_H_
++
++#include <linux/devfreq.h>
++
++enum df_device {
++	DEVFREQ_MSM_CPUBW,
++	DEVFREQ_MAX
++};
++
++#ifdef CONFIG_DEVFREQ_BOOST
++void devfreq_boost_kick(enum df_device device);
++void devfreq_boost_kick_max(enum df_device device, unsigned int duration_ms);
++void devfreq_register_boost_device(enum df_device device, struct devfreq *df);
++#else
++static inline
++void devfreq_boost_kick(enum df_device device)
++{
++}
++static inline
++void devfreq_boost_kick_max(enum df_device device, unsigned int duration_ms)
++{
++}
++static inline
++void devfreq_register_boost_device(enum df_device device, struct devfreq *df)
++{
++}
++#endif
++
++#endif /* _DEVFREQ_BOOST_H_ */
+-- 
+2.56.1
+
+From c5ab1eae1d39ed0a1d833b1fb736a8348d0cebcf Mon Sep 17 00:00:00 2001
+From: VoidDev-0 <dev.avax@protonmail.com>
+Date: Sun, 6 Nov 2022 14:16:03 +0100
+Subject: [PATCH] devfreq_boost: Adapt to MTK
+
+Signed-off-by: VoidDev-0 <dev.avax@protonmail.com>
+Signed-off-by: fjrXTR <fajarslebew31@gmail.com>
+---
+ drivers/devfreq/devfreq_boost.c | 39 +--------------------------------
+ 1 file changed, 1 insertion(+), 38 deletions(-)
+
+diff --git a/drivers/devfreq/devfreq_boost.c b/drivers/devfreq/devfreq_boost.c
+index fecb137f4..63a1cf772 100644
+--- a/drivers/devfreq/devfreq_boost.c
++++ b/drivers/devfreq/devfreq_boost.c
+@@ -10,6 +10,7 @@
+ #include <linux/input.h>
+ #include <linux/kthread.h>
+ #include <uapi/linux/sched/types.h>
++#include "governor.h"
+ 
+ enum {
+ 	SCREEN_OFF,
+@@ -29,7 +30,6 @@ struct boost_dev {
+ 
+ struct df_boost_drv {
+ 	struct boost_dev devices[DEVFREQ_MAX];
+-	struct notifier_block fb_notif;
+ };
+ 
+ static void devfreq_input_unboost(struct work_struct *work);
+@@ -176,33 +176,6 @@ static int devfreq_boost_thread(void *data)
+ 	return 0;
+ }
+ 
+-static int fb_notifier_cb(struct notifier_block *nb, unsigned long action,
+-			  void *data)
+-{
+-	struct df_boost_drv *d = container_of(nb, typeof(*d), fb_notif);
+-	int i, *blank = ((struct fb_event *)data)->data;
+-
+-	/* Parse framebuffer blank events as soon as they occur */
+-	if (action != FB_EARLY_EVENT_BLANK)
+-		return NOTIFY_OK;
+-
+-	/* Boost when the screen turns on and unboost when it turns off */
+-	for (i = 0; i < DEVFREQ_MAX; i++) {
+-		struct boost_dev *b = d->devices + i;
+-
+-		if (*blank == FB_BLANK_UNBLANK) {
+-			clear_bit(SCREEN_OFF, &b->state);
+-			__devfreq_boost_kick_max(b,
+-				CONFIG_DEVFREQ_WAKE_BOOST_DURATION_MS);
+-		} else {
+-			set_bit(SCREEN_OFF, &b->state);
+-			wake_up(&b->boost_waitq);
+-		}
+-	}
+-
+-	return NOTIFY_OK;
+-}
+-
+ static void devfreq_boost_input_event(struct input_handle *handle,
+ 				      unsigned int type, unsigned int code,
+ 				      int value)
+@@ -312,18 +285,8 @@ static int __init devfreq_boost_init(void)
+ 		goto stop_kthreads;
+ 	}
+ 
+-	d->fb_notif.notifier_call = fb_notifier_cb;
+-	d->fb_notif.priority = INT_MAX;
+-	ret = fb_register_client(&d->fb_notif);
+-	if (ret) {
+-		pr_err("Failed to register fb notifier, err: %d\n", ret);
+-		goto unregister_handler;
+-	}
+-
+ 	return 0;
+ 
+-unregister_handler:
+-	input_unregister_handler(&devfreq_boost_input_handler);
+ stop_kthreads:
+ 	while (i--)
+ 		kthread_stop(thread[i]);
+-- 
+2.56.1
+
