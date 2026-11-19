@@ -1,0 +1,114 @@
+From 49825fce53331474bc021f249b2c1a6b6c2ee94e Mon Sep 17 00:00:00 2001
+From: purdiantoefendi-cyber <purdianto.efendi@gmail.com>
+Date: Thu, 12 Nov 2026 15:37:50 +0700
+Subject: [PATCH] Introduce fake uname version choice in Kconfig
+
+Add configuration options for fake uname kernel version.
+---
+ init/Kconfig | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+index 9d8265016..367159750 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -30,6 +30,37 @@ config LLD_VERSION
+ 	int
+ 	default $(shell,$(srctree)/scripts/lld-version.sh $(LD))
+ 
++choice
++	prompt "Fake uname kernel version"
++	default FAKE_UNAME_NONE
++	help
++	  Kernel side spoof for BPF.
++
++config FAKE_UNAME_NONE
++	bool "None"
++	help
++	  Don't spoof uname version.
++
++config FAKE_UNAME_5_4
++	bool "5.4"
++
++config FAKE_UNAME_5_10
++	bool "5.10"
++
++config FAKE_UNAME_5_15
++	bool "5.15"
++
++config FAKE_UNAME_6_1
++	bool "6.1"
++
++config FAKE_UNAME_6_6
++	bool "6.6"
++
++config FAKE_UNAME_6_12
++	bool "6.12"
++
++endchoice
++
+ config CC_HAS_ASM_GOTO
+ 	def_bool $(success,$(srctree)/scripts/gcc-goto.sh $(CC))
+ 
+-- 
+2.56.1
+
+From 5ee667904bdd52da6df7358909f1576adb1db575 Mon Sep 17 00:00:00 2001
+From: purdiantoefendi-cyber <purdianto.efendi@gmail.com>
+Date: Thu, 12 Nov 2026 15:39:59 +0700
+Subject: [PATCH] Add fake uname definitions for various versions
+
+---
+ kernel/sys.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/kernel/sys.c b/kernel/sys.c
+index e9b370888..c482683b3 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -1255,6 +1255,23 @@ static int override_release(char __user *release, size_t len)
+ extern struct static_key_false susfs_is_uname_spoof_buffer_set;
+ extern void susfs_spoof_uname(struct new_utsname* tmp);
+ #endif
++
++#ifndef CONFIG_FAKE_UNAME_NONE
++#if defined(CONFIG_FAKE_UNAME_5_4)
++#define FAKE_UNAME "5.4.296"
++#elif defined(CONFIG_FAKE_UNAME_5_10)
++#define FAKE_UNAME "5.10.241"
++#elif defined(CONFIG_FAKE_UNAME_5_15)
++#define FAKE_UNAME "5.15.190"
++#elif defined(CONFIG_FAKE_UNAME_6_1)
++#define FAKE_UNAME "6.1.149"
++#elif defined(CONFIG_FAKE_UNAME_6_6)
++#define FAKE_UNAME "6.6.103"
++#elif defined(CONFIG_FAKE_UNAME_6_12)
++#define FAKE_UNAME "6.12.44"
++#endif
++#endif
++
+ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
+ {
+ 	struct new_utsname tmp;
+@@ -1265,6 +1282,18 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
+ 	if (static_branch_likely(&susfs_is_uname_spoof_buffer_set))
+ 		susfs_spoof_uname(&tmp);
+ #endif
++
++#ifndef CONFIG_FAKE_UNAME_NONE
++	if (!strncmp(current->comm, "bpfloader", 9) ||
++	    !strncmp(current->comm, "netbpfload", 10) ||
++	    !strncmp(current->comm, "netd", 4) ||
++	    !strncmp(current->comm, "uprobestats", 11)) {
++		strlcpy(tmp.release, FAKE_UNAME, sizeof(tmp.release));
++		pr_debug("fake uname: %s/%d release=%s\n",
++			 current->comm, current->pid, tmp.release);
++	}
++#endif
++
+ 	up_read(&uts_sem);
+ 	if (copy_to_user(name, &tmp, sizeof(tmp)))
+ 		return -EFAULT;
+-- 
+2.56.1
+
